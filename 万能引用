@@ -1,0 +1,78 @@
+面试官：右值引用可以绑定右值，也可以绑定左值吗？
+
+应聘者：
+这是一个非常核心的区分！准确的答案是：纯粹的右值引用只能绑定到右值，不能直接绑定到左值。但是模板中的"万能引用"可以绑定到左值。
+
+让我详细解释这个重要区别：
+
+1. 纯粹的右值引用（非模板情况）
+当T是具体类型时，T&&只能绑定到右值：
+
+void func(int&& rref); // 右值引用参数
+
+int main() {
+    int a = 10; // a是左值
+    
+    func(10);            // ✅ 正确：字面量10是纯右值
+    func(std::move(a));  // ✅ 正确：std::move(a)产生将亡值
+    func(a);             // ❌ 错误：无法将左值a绑定到右值引用
+
+    return 0;
+}
+
+编译错误信息通常是：
+cannot bind non-const lvalue reference of type 'int&' to an rvalue of type 'int'
+
+核心规则：如果函数参数是T&&（T是具体类型），只能传递临时对象、字面量或使用std::move()转换后的左值。
+
+2. 万能引用（模板情况）
+当T&&出现在模板参数推导上下文中时，称为"万能引用"，可以绑定到各种值：
+
+template<typename T>
+void universal_func(T&& arg) { // arg是万能引用
+    // ... 
+}
+
+int main() {
+    int a = 10;
+    const int b = 20;
+
+    universal_func(10);    // ✅ 绑定到右值，T推导为int
+    universal_func(a);     // ✅ 绑定到左值，T推导为int&  
+    universal_func(b);     // ✅ 绑定到const左值，T推导为const int&
+    universal_func(std::move(a)); // ✅ 绑定到右值，T推导为int
+
+    return 0;
+}
+
+万能引用的触发条件：
+• 必须有模板参数推导
+• 形式必须正好是T&&（不能是const T&&等）
+• 这是实现完美转发的技术基础
+
+3. auto&&也是万能引用
+同样适用类型推导规则：
+
+int main() {
+    int a = 10;
+
+    auto&& r1 = 10;   // ✅ r1是int&&，绑定到右值
+    auto&& r2 = a;    // ✅ r2是int&，绑定到左值
+    auto&& r3 = std::move(a); // ✅ r3是int&&，绑定到右值
+
+    return 0;
+}
+
+总结对比：
+引用类型          示例          绑定左值  绑定右值  说明
+左值引用        int&          ✅       ❌      传统引用
+常量左值引用     const int&    ✅       ✅      只读"万能"引用
+右值引用        int&&         ❌       ✅      只能绑定右值
+万能引用        template<T> T&& ✅       ✅      用于模板和完美转发
+auto&&         auto&&        ✅       ✅      自动类型推导
+
+简单记忆：
+• 类型&&（如int&&）：只能绑定右值
+• 模板T&&或auto&&：可以绑定左值和右值
+
+所以精确答案是：纯粹的、非模板的右值引用不能绑定到左值；但模板中的万能引用可以。
