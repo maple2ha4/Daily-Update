@@ -1,0 +1,21 @@
+面试官: 如何定义一个只能在堆上生成对象的类？
+
+回答者: 要实现这一点，核心原理是「阻止编译器在栈上自动调用析构函数」。具体方法如下：
+
+1. **将析构函数设为私有或保护**：
+   - 编译器在栈上分配对象时，会检查析构函数的可访问性。若析构函数不可访问（如设为 `private`），则静态建立（如 `A a;`）会编译失败。
+   - 示例代码：
+    class HeapOnly {
+    protected:
+        ~HeapOnly() {} // 保护析构函数
+    public:
+        static HeapOnly* create() {
+            return new HeapOnly(); // 必须通过new动态创建
+        }
+        void destroy() {
+            delete this; // 必须通过成员函数释放
+        }
+    private:
+        HeapOnly() {} // 构造函数也可设为私有
+    };
+
