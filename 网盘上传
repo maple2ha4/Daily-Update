@@ -1,0 +1,219 @@
+面试官: 说一下你的上传功能
+
+回答:
+  1.客户端： 
+    首先用户点击选择要上传的文件，点击上传文件按钮，客户端就会获取[文件路径、文件大小]、计算文件的MD5值（用于秒传验证），
+    接着客户端构造上传请求协议包(协议包内含 [用户id、文件名称、文件大小、文件MD5值])。
+    然后发送上传请求到服务器，并在客户端本地记录文件上传信息[文件路径、大小、文件id]（用于后续管理）。我这里用的是map，将文件名映射成文件信息。
+
+  2.服务器：
+    服务器网络模块接收到请求包，交由kernel模块解析处理。kernel模块解析到这是一个上传请求协议包，调用上传文件回复包函数。
+    首先解析客户端上传请求数据包，并准备响应包。接着通过MD5值查询数据库检查文件是否存在。
+    存在，则提取数据库查询结果（原始上传用户、文件id、文件引用计数），并设置响应包中的文件id。
+    接着判断这个文件是不是自己上传的。如果是自己上传的，则检查map表里是否有这个文件未完整的上传记录（因为文件完全上传后会从map中删除记录）。
+    如果没有这个文件未完整上传的记录，表示文件已完整上传过；如果有记录，则将响应包结果设置为断点续传，并设置回复包已上传的位置。
+    如果不是自己上传的，则启用秒传，更新文件引用计数，建立新用户与文件的关联。
+    如果数据库不存在该文件，则需完整上传。将响应包结果设置为普通上传，并构建文件存储路径，将文件信息插入数据库，并获取数据库中为该文件分配的id，建立用户与文件的关联。
+    接着创建空文件准备接收数据，并记录上传状态信息，最后发送响应给客户端。
+
+  3.客户端：
+    客户端接收到响应包，解析到这是上传文件响应包，则发送一个信号，关联该信号的上传文件函数响应。
+    首先获取文件名并查找本地存储的上传信息（在断点续传或正常传时创建文件上传任务时作为上传文件信息指针参数），
+    并根据服务器返回的结果类型进行不同处理。若响应包结果为文件已上传过，则提示文件已上传过；若结果为秒传，则提示秒传成功（引用计数和数据库关联在服务器端已完成更新）；
+    若结果为断点续传或正常传，则创建文件上传任务并加入线程池。文件上传任务类包含[上传文件信息、服务器分配的文件id、文件上传的起始位置、父对象指针（用于回调）]，并将任务加入到线程池队列。
+    
+    
+
+
+
+
+
+
+
+
+a.
+void Widget::on_pushButton_clicked()//上传文件
+{
+    //获取上传文件信息（文件名，大小，MD5）
+    // 1. 获取用户选择的文件路径
+    QString filePath = QFileDialog::getOpenFileName(this,tr("Open file"),
+                                                  ".",//打开文件的根目录
+                                                    "ALL files (*.*);;Images (*.png *.xpm *.jpg);;Text files(*.txt))");
+    // 检查用户是否取消了文件选择
+    if(filePath.isEmpty())
+    {
+        return; // 用户取消选择，直接返回
+    }
+    
+    // 2. 从完整路径中提取文件名（最后一部分）
+    QString fileName =filePath.section('/',-1);
+    QFile file(filePath);
+    
+    // 3. 获取文件大小
+    long long filesize;
+    if(file.open(QIODevice::ReadOnly))  // 以只读方式打开文件
+    {
+        filesize=file.size();   // 获取文件大小（字节数）
+        file.close();   // 立即关闭文件
+    }
+    else
+    {
+        printf("file open fail!");
+    }
+    
+    // 4. 计算文件的MD5校验值（用于秒传验证）
+    string strMD5 = FileDigest(filePath);   //记录md5值
+    //qDebug()<<strMD5.c_str();
+    //上传文件信息请求表
+    
+    // 5. 构造上传请求协议包
+    STRU_UPLOADFILEINFO_RQ sur;
+    sur.m_filesize = filesize;
+    sur.m_userid = m_userId;
+    strcpy(sur.m_szFileMD5, strMD5.c_str());
+    strcpy(sur.m_szFileName, fileName.toStdString().c_str());
+    
+    // 6. 发送上传请求到服务器
+    m_pKernel->sendData((char*)&sur,sizeof(sur));
+    
+    // 7. 在客户端本地记录文件上传信息 文件路径 大小 文件id （用于后续管理）
+    UploadFileInfo* p = new UploadFileInfo;
+    strcpy(p->m_szFilePath,filePath.toStdString().c_str());
+    p->m_fileId = 0;    // 初始文件ID（服务器会分配真实ID）
+    p->m_fileSize=filesize;
+    m_mapFileNametoFileInfo[fileName] = p;    // 将上传信息存入映射表（文件名->上传信息）
+
+}
+    此时只是发送了上传请求，真正的文件传输会在：收到服务器响应后（slot_uploadfileinfo）根据响应类型（正常传/秒传/续传）执行不同操作
+    这个函数是文件上传流程的起点，负责收集文件信息并初始化上传任务，后续的实际传输由其他函数处理。
+
+
+
+
+b.
+void TCPKernel::uploadfileinforq(SOCKET sock, char *szbuf)
+{
+    // 1. 解析客户端上传请求数据包
+    STRU_UPLOADFILEINFO_RQ *psur=(STRU_UPLOADFILEINFO_RQ*)szbuf;
+    char szsql[SQLLEN]={0};
+    list<string> lststr;
+    
+    // 2. 准备响应包
+    STRU_UPLOADFILEINFO_RS sur;
+    strcpy(sur.m_szFileName,psur->m_szFileName);    // 拷贝文件名用于响应
+    sur.m_pos = 0;    // 初始上传位置为0
+    
+    // 3. 查询数据库检查文件是否已存在（通过MD5值）
+    sprintf(szsql,"select u_id, f_id, f_count from myview where f_md5 = '%s';", psur->m_szFileMD5);
+    m_pSQL->SelectMySql(szsql,3,lststr);
+    
+    // 4. 判断数据库是否存在该文件
+    if(lststr.size()>0)
+    {
+        // 4.1 存在，提取数据库查询结果
+        string strUserId=lststr.front();    // 原始上传用户ID
+        lststr.pop_front();
+        string strFileId=lststr.front();    // 文件ID
+        lststr.pop_front();
+        string strFilecount=lststr.front(); // 文件引用计数
+        lststr.pop_front();
+        
+        long long userId = atoll(strUserId.c_str());
+        long long FileId = atoll(strFileId.c_str());
+        sur.m_fileId = FileId;    // 设置响应包中的文件ID
+        
+        //判断这个文件是不是自己传的，1如果没有传完--断点续传 2如果传完了--重复上传
+        // 4.2 判断是否是同一用户上传
+        if(psur->m_userid == userId)
+        {
+            // 同一用户上传同一文件
+            sur.m_szResult = _uploadinfo_isuploaded;  // 默认标记为已上传
+            
+            // 检查是否有未完成的上传记录
+            UploadFileInfo*pInfo = m_mapFileIdtoFileInfo[FileId];
+
+            //pInfo不为空代表有上传记录但未完全上传或未上传过(这里指前者) 在TCPKernel::uploadfileblockrq文件完全上传后会从map中删除记录
+            if(pInfo)
+            {
+                // 存在未完成的上传记录，启用断点续传
+                sur.m_szResult=_uploadinfo_continue; 
+                printf("continue_transfer\n");
+                sur.m_pos = pInfo->m_pos;   // 返回已上传的位置
+            }
+            else    //pInfo为空 文件已完整上传过
+            {
+                printf("istransfered!\n");
+            }
+
+        }
+        else
+        {
+            // 不同用户上传相同文件，启用秒传
+            sur.m_szResult = _uploadinfo_speedtranfer;
+            
+            // 4.3 更新文件引用计数
+            sprintf(szsql,"update file set f_count = f_count + 1 where f_id = %lld;", FileId);
+            m_pSQL->UpdateMySql(szsql);
+            
+            // 4.4 建立新用户与文件的关联
+            sprintf(szsql,"insert into user_file(u_id, f_id) values(%lld, %lld);", psur->m_userid, FileId); //关联用户与文件
+            m_pSQL->UpdateMySql(szsql);
+            
+            printf("others transfered!count+1\n");
+        }
+    }
+    else
+    {
+        // 5. 数据库不存在该文件，需要完整上传
+        printf("normal transfer!\n");
+        sur.m_szResult=_uploadinfo_normal;
+        
+        // 5.1 构造文件存储路径
+        char szFilePath[MAX_PATH]={0};
+        //C:\mydisk/+ userid/+ filename
+        QString fileName = QString::fromUtf8(psur->m_szFileName);
+        sprintf(szFilePath,"%s%lld/%s",m_szSystemPath,psur->m_userid,fileName.toStdString().c_str());
+
+        // 5.2 将文件信息插入数据库
+        sprintf(szsql,"insert into file(f_name,f_size,f_path,f_md5) values('%s',%lld,'%s','%s')",
+                psur->m_szFileName,psur->m_filesize,szFilePath,psur->m_szFileMD5);
+        m_pSQL->UpdateMySql(szsql);
+
+        // 5.3 获取新插入的文件ID
+        sprintf(szsql,"select f_id from file where f_md5 = '%s'", psur->m_szFileMD5); //通过md5找到文件id
+        m_pSQL->SelectMySql(szsql,1,lststr);
+        if(lststr.size()>0)
+        {
+            string strFileId = lststr.front();
+            lststr.pop_front();
+            
+            // 5.4 建立用户与文件的关联
+            sprintf(szsql,"insert into user_file(u_id, f_id) values(%lld,%lld);",psur->m_userid,atoll(strFileId.c_str()));
+            sur.m_fileId=atoll(strFileId.c_str());
+            m_pSQL->UpdateMySql(szsql);
+        }
+        
+        //FILE* pfile=fopen(szFilePath,"wb");
+        //记录文件信息 fileid--(文件指针 大小 位置)
+        
+        // 5.5 在服务器创建空文件准备接收数据
+        QString fullPath = szFilePath;
+        std::wstring wpath = fullPath.toStdWString();
+        FILE* pfile = _wfopen(wpath.c_str(), L"wb");    // 二进制写模式打开文件
+        if(!pfile)
+        {
+            printf("create file fail\n");
+        }
+        
+        // 5.6 记录上传状态信息
+        UploadFileInfo* p = new UploadFileInfo;
+        p->m_pfile = pfile;   // 文件指针
+        p->m_fileSize=psur->m_filesize;  // 文件总大小
+        p->m_pos = 0;   // 当前上传位置
+        p->m_userId = psur->m_userid;   // 用户ID
+        m_mapFileIdtoFileInfo[sur.m_fileId] = p;    // 存入上传状态Map
+    }
+    // 6. 发送响应给客户端
+    m_pTCPNet->sendData(sock,(char*)&sur,sizeof(sur));
+}
+这个函数是服务器处理文件上传的核心逻辑，实现了网盘系统的关键功能：秒传、断点续传和正常上传。通过MD5校验和状态管理，显著提升了文件上传的效率和可靠性。
