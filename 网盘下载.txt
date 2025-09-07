@@ -1,0 +1,22 @@
+面试官：你是怎么实现的下载功能？
+回答：
+
+客户端（发起下载请求）：
+首先用户在主界面（Widget.ui）的文件列表中，双击目标文件触发下载操作 —— 弹窗提供 “下载 / 删除 / 取消” 选项，用户选择 “下载” 后，客户端会先通过QFileDialog::getExistingDirectory让用户选择下载保存目录，确保后续文件有明确的存储路径。
+接着客户端会收集下载所需的核心信息：从表格中获取选中文件的 “文件名”“文件大小”，结合当前登录用户的m_userId（已登录时存储在Widget类中），构造STRU_DOWNLOADFILE_RQ协议包（协议定义在Packdef.h）—— 其中downloadpath字段存入用户选择的目录路径，filename字段存入目标文件名，m_userid字段绑定当前用户 ID，确保服务器能精准定位用户有权限下载的文件。
+最后通过m_pKernel->sendData将协议包发送给服务器，同时在本地m_mapFidtoDownloadfileInfo（Widget.cpp中的 map 结构）初始化下载状态：键为后续服务器返回的fileid，值为DownloadFileInfo结构体（存储下载路径、已接收位置、文件总大小、文件指针），为后续接收分块做准备。
+服务器（处理下载请求）：
+服务器的网络模块（TCPNet.cpp）接收到下载请求包后，会将数据转发给核心逻辑层（TCPKernel.cpp）的downloadfile函数。该函数首先解析STRU_DOWNLOADFILE_RQ包，提取m_userid和filename，通过 SQL 语句 “select file.f_id,f_path from file join user_file on file.f_id=user_file.f_id and user_file.u_id=%d and f_name='%s'” 查询 MySQL 数据库 —— 既验证用户对该文件的下载权限（通过user_file表的关联），又获取文件在服务器本地的存储路径（f_path）和唯一f_id。
+为避免单线程处理导致的阻塞（比如大文件传输时占用主线程），服务器会创建独立线程（std::thread downloadthread），调用download函数执行实际的文件发送逻辑。在download函数中，服务器先以 “只读二进制” 模式（_wfopen，支持中文路径）打开目标文件，通过getFileSize函数获取文件总大小，然后循环读取文件内容 —— 每次读取ONE_PAGE=4096字节（与上传分块大小一致，保证传输兼容性），构造STRU_DOWNLOADFILE_RS协议包，将 “分块数据”“分块大小”“文件总大小”“文件 ID” 等信息封装后，通过pTCPNet->sendData发送给客户端，直至文件全部读取完毕。
+客户端（接收文件分块并写入）：
+客户端网络模块（TCPNet.cpp）接收到服务器的分块数据后，会判断数据类型（非 JSON），通过TCPKernel::dealData函数发送signal_downlowad信号，触发Widget::slot_download槽函数。
+在slot_download函数中，客户端首先解析STRU_DOWNLOADFILE_RS包，提取fileid（服务器分配的唯一标识）、m_filecontent（分块数据）、pagesize（分块实际大小）、totalfilesize（文件总大小）。然后通过fileid在m_mapFidtoDownloadfileInfo中找到对应的下载状态：
+若为首次接收（map 中无该fileid）：则拼接 “下载目录 + 文件名” 作为完整路径，用_wfopen以 “写入二进制” 模式（L"wb"）创建本地文件，初始化DownloadFileInfo结构体（m_pos=0、m_filesize=totalfilesize、pfile=创建的文件指针），存入 map；
+若为续传（map 中已有该fileid）：则通过_fseeki64将文件指针定位到m_pos（上次中断的位置），避免重复写入已接收内容。
+接着调用fwrite将分块数据写入本地文件，每次写入后更新m_pos（m_pos += 写入字节数），并通过fflush强制刷新磁盘缓存，确保数据不会因程序崩溃丢失。当m_pos等于totalfilesize时，说明文件传输完成 —— 关闭文件指针，从 map 中删除该fileid的记录，释放资源，并弹窗提示 “下载成功”。
+特殊场景：分享链接下载（客户端 + 服务器）：
+除了常规下载，项目还支持 “分享码下载”：客户端点击 “提取链接” 按钮（Widget.ui），加载pickLink.ui界面让用户输入分享码，然后构造 JSON 格式的请求（含link（分享码）、path（下载目录）、uid（当前用户 ID）），通过m_pKernel->sendData发送给服务器。
+服务器接收后，在TCPKernel::getlinkfile函数中，先通过RedisManager查询 Redis 缓存（键为 “file:分享码”）—— 若缓存命中（分享码未过期），直接获取文件f_id和f_path；若缓存未命中，则查询 MySQL 的user_share表，确认分享码有效性后获取文件信息。之后调用downloadbyjson函数，以 JSON 分块方式发送文件：先发送HEAD（含文件大小、文件名、下载路径），再分块发送BODY（文件内容用 Base64 编码，避免二进制数据传输丢失），最后发送TAIL（标记传输完成）。
+客户端在slot_downloadbyjson函数中，解析 JSON 分块类型：HEAD时初始化下载文件，BODY时解码 Base64 数据并写入文件，TAIL时完成资源清理，实现分享文件的完整下载。
+
+整个下载功能通过 “分块传输” 降低单次传输压力，通过 “用户权限校验”（MySQL 关联表）保证安全性，通过 “缓存查询”（Redis）提升分享下载效率，同时兼容常规下载和分享下载两种场景，覆盖用户日常使用需求。
