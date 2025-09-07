@@ -21,8 +21,13 @@
     首先获取文件名并查找本地存储的上传信息（在断点续传或正常传时创建文件上传任务时作为上传文件信息指针参数），
     并根据服务器返回的结果类型进行不同处理。若响应包结果为文件已上传过，则提示文件已上传过；若结果为秒传，则提示秒传成功（引用计数和数据库关联在服务器端已完成更新）；
     若结果为断点续传或正常传，则创建文件上传任务并加入线程池。文件上传任务类包含[上传文件信息、服务器分配的文件id、文件上传的起始位置、父对象指针（用于回调）]，并将任务加入到线程池队列。
-    
-    
+    工作线程执行任务，先打开本地文件，然后处理断点续传逻辑，将文件指针定位到上次中断的位置。接着准备文件块传输协议包，从文件循环读取并发送文件块。
+    我这个项目设置的是每次最多读取ONE_PAGE4096字节，也就是一次4KB。直至读取完成。传输完成后从上传管理map中溢出已完成的任务。
+
+    注释：这一步是客户端读取要传输的文件内容，写入是在下一步服务器收到文件块传输请求包后调用uploadfileblockrq进行写入的。
+
+  4.服务器：
+    服务器接受到文件块传输请求包，调用写入文件函数
 
 
 
@@ -31,7 +36,8 @@
 
 
 
-a.
+
+a.客户端
 void Widget::on_pushButton_clicked()//上传文件
 {
     //获取上传文件信息（文件名，大小，MD5）
@@ -89,8 +95,10 @@ void Widget::on_pushButton_clicked()//上传文件
 
 
 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-b.
+
+b.服务器
 void TCPKernel::uploadfileinforq(SOCKET sock, char *szbuf)
 {
     // 1. 解析客户端上传请求数据包
@@ -217,3 +225,152 @@ void TCPKernel::uploadfileinforq(SOCKET sock, char *szbuf)
     m_pTCPNet->sendData(sock,(char*)&sur,sizeof(sur));
 }
 这个函数是服务器处理文件上传的核心逻辑，实现了网盘系统的关键功能：秒传、断点续传和正常上传。通过MD5校验和状态管理，显著提升了文件上传的效率和可靠性。
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+c.客户端
+void TCPKernel::dealData(const char *szbuf)
+{
+    //todo
+    switch(*szbuf)
+    {
+    case _default_protocol_uploadfileinfo_rs:
+        emit signal_uploadfileinfo((STRU_UPLOADFILEINFO_RS*)szbuf);
+        break;
+}
+
+void Widget::slot_uploadfileinfo(STRU_UPLOADFILEINFO_RS *psur)
+{
+    // 1. 获取文件名并查找本地存储的上传信息
+    QString strFileName = psur->m_szFileName;
+    UploadFileInfo* pInfo = m_mapFileNametoFileInfo[strFileName];
+
+    // 2. 根据服务器返回的结果类型进行不同处理
+    if(psur->m_szResult == _uploadinfo_isuploaded)
+    {
+        //QMessageBox弹出一个模态对话框，告知用户某个操作已完成
+                           //  父类指针  窗口标题       对话框正文
+        // 2.1 文件已上传过（重复上传）
+        QMessageBox::information(this,"uploadfile","file is uploaded");
+    }
+    else if(_uploadinfo_speedtranfer == psur->m_szResult)
+    {
+        // 2.2 秒传成功（文件已存在于服务器）
+        qDebug() << "speedtransfer\n";
+    }
+    else if(psur->m_szResult == _uploadinfo_continue || psur->m_szResult == _uploadinfo_normal)
+    {
+        // 2.3 需要实际传输文件（正常上传或断点续传）
+        // 创建文件上传任务并加入线程池
+        task *p = new SendFileItask(
+            pInfo,  //上传文件信息
+            psur->m_pos,    //起始位置（续传时为断点位置）
+            psur->m_fileId, //服务器分配的文件id
+            this);  //父对象指针，用于回调
+        m_tp.push(p);   //将任务加入到线程池队列
+    }
+
+    //将文件信息显示到控件上
+    // 3. 更新UI显示
+    // 3.1 在表格中插入新行显示文件信息
+    QTableWidgetItem* p = new QTableWidgetItem(QIcon("./pic.JPG"),strFileName);
+    ui->tableWidget->setItem(m_FileNum, 0, p);  // 第一列：文件名（带图标）
+
+    // 3.2 显示文件大小
+    QString strFileSize = QString::number(pInfo->m_fileSize);
+    p = new QTableWidgetItem(strFileSize);
+    ui->tableWidget->setItem(m_FileNum,1,p);    // 第二列：文件大小
+
+    // 3.3 显示当前时间（作为上传时间）
+    QDateTime datetime = QDateTime::currentDateTime();
+    QString strDateTime = datetime.toString("dd.MM.yyyy HH.mm.ss");
+    p = new QTableWidgetItem(strDateTime);  // 第三列：上传时间
+    ui->tableWidget->setItem(m_FileNum,2,p);
+
+    ++m_FileNum;    // 增加文件计数，为下一个文件准备
+    // 4. 显示上传成功提示
+    QMessageBox::information(this,"uploadfile","file upload success");
+}
+
+经过线程池push->run后
+
+void SendFileItask::run()
+{
+    // 转换UTF-8路径为宽字符
+    // 使用_wfopen打开文件
+    // 1. 打开本地文件
+    FILE* pfile = _wfopen(utf8ToWide(m_pInfo->m_szFilePath).c_str(), L"rb");
+    if (!pfile) {
+        qDebug() << "Failed to open file:" << m_pInfo->m_szFilePath;
+        return; // 直接返回或处理错误
+    }
+
+    // 2. 处理断点续传逻辑
+    if(m_pos)
+    {
+        //如果是断点续传
+        // 将文件指针定位到上次中断的位置
+        fseek(pfile,m_pos,SEEK_SET);
+    }
+    //正常发送文件内容
+
+    // 3. 准备文件块传输协议包
+    STRU_UPLOADFILEBLOCK_RQ sur;
+    sur.m_fileId = m_fileId;    //设置服务器分配的文件ID
+
+    // 4. 循环读取并发送文件块
+    while(1)
+    {
+        // 4.1 从文件读取数据块（每次最多读取ONE_PAGE大小）
+        ssize_t nReadNum = fread(
+            sur.m_szFileContent,    // 数据缓冲区
+            sizeof(char),           // 每个元素大小
+            sizeof(sur.m_szFileContent),    // 缓冲区容量（协议包定义为ONE_PAGE=4096）
+            pfile);                 // 文件指针
+        
+        // 4.2 成功读取到数据
+        if(nReadNum > 0)
+        {
+            //qDebug()<<"nReadNum="<<nReadNum<<endl;
+            sur.m_fileNum=nReadNum; // 设置实际读取的字节数
+            // 通过内核对象发送数据块到服务器
+            m_pWidget->m_pKernel->sendData((char*)&sur,sizeof(sur));
+        }
+        else
+        {
+            // 读取结束或出错（nReadNum=0）
+            //qDebug()<<"break:nReadNum="<<nReadNum<<endl;
+            break;
+        }
+    }
+    
+    // 5. 资源清理
+    fclose(pfile);// 关闭文件
+    
+    // 6. 从上传管理Map中移除已完成的任务
+    QString strFilePath = m_pInfo->m_szFilePath;
+    strFilePath = strFilePath.section('/',-1);  // 提取纯文件名
+    auto ite = m_pWidget->m_mapFileNametoFileInfo.begin();
+    while(ite != m_pWidget->m_mapFileNametoFileInfo.end())
+    {
+        if(ite->first == strFilePath)
+        {
+            ite = m_pWidget->m_mapFileNametoFileInfo.erase(ite);
+            break;
+        }
+        ite++;
+    }
+}
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+d.服务器
+
