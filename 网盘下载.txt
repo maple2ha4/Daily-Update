@@ -2,11 +2,15 @@
 回答：
 
 客户端（发起下载请求）：
-首先用户在主界面（Widget.ui）的文件列表中，双击目标文件触发下载操作 —— 弹窗提供 “下载 / 删除 / 取消” 选项，用户选择 “下载” 后，客户端会先通过QFileDialog::getExistingDirectory让用户选择下载保存目录，确保后续文件有明确的存储路径。
-接着客户端会收集下载所需的核心信息：从表格中获取选中文件的 “文件名”“文件大小”，结合当前登录用户的m_userId（已登录时存储在Widget类中），构造STRU_DOWNLOADFILE_RQ协议包（协议定义在Packdef.h）—— 其中downloadpath字段存入用户选择的目录路径，filename字段存入目标文件名，m_userid字段绑定当前用户 ID，确保服务器能精准定位用户有权限下载的文件。
-最后通过m_pKernel->sendData将协议包发送给服务器，同时在本地m_mapFidtoDownloadfileInfo（Widget.cpp中的 map 结构）初始化下载状态：键为后续服务器返回的fileid，值为DownloadFileInfo结构体（存储下载路径、已接收位置、文件总大小、文件指针），为后续接收分块做准备。
+
+首先用户在主界面（Widget.ui）的文件列表中，双击目标文件触发下载操作 —— 弹窗提供 “下载 / 取消” 选项，用户选择 “下载” 后，客户端会先通过QFileDialog::getExistingDirectory让用户选择下载保存目录，确保后续文件有明确的存储路径。
+接着客户端会收集下载所需的核心信息：从表格中获取选中文件的 “文件名”“文件大小”，结合当前登录用户的m_userId（已登录时存储在Widget类中），构造下载请求协议包 —— 其中downloadpath字段存入用户选择的目录路径，filename字段存入目标文件名，m_userid字段绑定当前用户 ID，确保服务器能精准定位用户有权限下载的文件。
+最后将协议包发送给服务器，同时在本地m_mapFidtoDownloadfileInfo（Widget.cpp中的 map 结构）初始化下载状态：键为后续服务器返回的fileid，值为下载文件信息结构体(DownloadFileInfo)（存储下载路径、已接收位置、文件总大小、文件指针），为后续接收分块做准备。
+
+
 服务器（处理下载请求）：
-服务器的网络模块（TCPNet.cpp）接收到下载请求包后，会将数据转发给核心逻辑层（TCPKernel.cpp）的downloadfile函数。该函数首先解析STRU_DOWNLOADFILE_RQ包，提取m_userid和filename，通过 SQL 语句 “select file.f_id,f_path from file join user_file on file.f_id=user_file.f_id and user_file.u_id=%d and f_name='%s'” 查询 MySQL 数据库 —— 既验证用户对该文件的下载权限（通过user_file表的关联），又获取文件在服务器本地的存储路径（f_path）和唯一f_id。
+
+服务器的网络模块（TCPNet.cpp）接收到下载请求包后，会将数据转发给核心逻辑层（TCPKernel.cpp）的downloadfile函数。该函数首先解析下载请求协议包，提取m_userid（用户id）和filename（文件名称），通过 SQL 语句 “select file.f_id,f_path from file join user_file on file.f_id=user_file.f_id and user_file.u_id=%d and f_name='%s'” 查询 MySQL 数据库 —— 既验证用户对该文件的下载权限（通过user_file表的关联），又获取文件在服务器本地的存储路径（f_path）和唯一f_id。
 为避免单线程处理导致的阻塞（比如大文件传输时占用主线程），服务器会创建独立线程（std::thread downloadthread），调用download函数执行实际的文件发送逻辑。在download函数中，服务器先以 “只读二进制” 模式（_wfopen，支持中文路径）打开目标文件，通过getFileSize函数获取文件总大小，然后循环读取文件内容 —— 每次读取ONE_PAGE=4096字节（与上传分块大小一致，保证传输兼容性），构造STRU_DOWNLOADFILE_RS协议包，将 “分块数据”“分块大小”“文件总大小”“文件 ID” 等信息封装后，通过pTCPNet->sendData发送给客户端，直至文件全部读取完毕。
 客户端（接收文件分块并写入）：
 客户端网络模块（TCPNet.cpp）接收到服务器的分块数据后，会判断数据类型（非 JSON），通过TCPKernel::dealData函数发送signal_downlowad信号，触发Widget::slot_download槽函数。
