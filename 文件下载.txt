@@ -3,4 +3,214 @@
 
 客户端（发起下载请求）：
 首先用户在主页面的文件列表中，双击目标文件，点击下载按钮后，选择文件下载保存目录，确保后续文件有明确的存储路径。
-接着客户端会
+接着客户端会从表格中获取选中文件下载所需的核心信息[文件名、文件大小]，结合当前登录的用户m_userId(登录时存储在客户端)，构建下载请求协议包，并发送给服务器。
+
+服务器（处理下载请求）：
+服务器接收到请求包后，解析到这是一个下载请求协议包，交由文件下载函数处理。首先从下载请求协议包中提取到[用户id、文件名称]，通过数据库查询到文件id与目标文件在服务器中的目录。接着创建线程执行下载操作。首先打开目标文件，获取文件总大小，然后循环读取文件内容，每次读取ONE_PAGE(4096字节），构造下载文件回复协议包，内含[分块数据、分块大小、文件总大小、文件id等]，将其发送给客户端，直至文件全部读取完毕。
+
+客户端：
+客户端接收到服务器的下载文件回复协议包，会发送下载文件信号，从而触发下载文件槽函数。槽函数中，首先解析协议包，接着看文件下载状态map表中查询对应的下载状态。如果map中没有对应的文件id，代表为首次下载，则拼接下载目录+文件名作为完整路径，创建本地文件，初始化下载文件结构体[(DownloadFileInfo)，将其文件指针置为起始位置，文件大小设置为目标文件大小，设置文件指针]，将文件id与下载文件结构体作为键值对存入map表中。若为续传（map中已有该文件id），则将文件指针定位到上次中断的位置。
+接着将分块数据写入本地文件，每次写入后更新写入位置，并通过fflush强制刷新磁盘缓存，确保数据不会因为程序崩溃丢失。当文件指针位置等于文件大小时，说明文件上传成功，并从map中删除该文件id的记录，释放资源，并提示下载成功。
+
+
+
+
+a.Widget.cpp
+
+void Widget::on_tableWidget_cellDoubleClicked(int row, int column)
+{
+    // 1. 弹窗让用户选择“下载/删除/取消”操作
+    QMessageBox msgBox;
+    msgBox.setWindowTitle("提示");
+    msgBox.setText("选择你的操作");
+
+    // 添加自定义按钮（文本和角色）
+    QPushButton *saveBtn = msgBox.addButton("下载", QMessageBox::AcceptRole);
+    QPushButton *discardBtn = msgBox.addButton("删除", QMessageBox::RejectRole);
+    QPushButton *cancelBtn = msgBox.addButton("取消", QMessageBox::DestructiveRole);
+
+    msgBox.exec();
+
+    // 2. 用户选择“下载”后，处理下载逻辑
+    if (msgBox.clickedButton() == saveBtn) {
+
+        // 2.1 让用户选择下载保存目录
+        QString dir = QFileDialog::getExistingDirectory(
+            nullptr,                 // 父窗口
+            "选择下载目录",               // 对话框标题
+            QDir::homePath(),        // 默认打开的目录（这里是用户主目录）
+            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks
+            );
+        if(dir.isEmpty())
+        {
+            // 用户取消目录选择，直接返回
+            return;
+        }
+        string sdir=dir.toUtf8().toStdString();
+
+        // 2.2 构造下载请求协议包
+        STRU_DOWNLOADFILE_RQ sdq;
+        strcpy(sdq.downloadpath,sdir.c_str());
+        sdq.m_userid=m_userId;
+
+        // 从表格中获取目标文件名和大小
+        QTableWidgetItem* item=ui->tableWidget->item(row,0);
+        QString fname=item?item->text():"";
+        item=ui->tableWidget->item(row,1);
+        QString fsize=item?item->text():"";
+        sdq.file_size=std::stoll(fsize.toStdString());
+        strcpy(sdq.filename,fname.toStdString().c_str());
+
+        // 2.3 发送下载请求到服务器
+        m_pKernel->sendData((char*)&sdq,sizeof(sdq));
+
+    } else if (msgBox.clickedButton() == discardBtn) {
+        qDebug() << "用户点击了删除";
+    } else if (msgBox.clickedButton() == cancelBtn) {
+        qDebug() << "用户点击了取消";
+    }
+}
+
+
+------------------------------------------------------------------------------------------------------------
+
+b.服务器tcpkenel.cpp
+
+// 处理下载请求的入口函数
+void TCPKernel::downloadfile(SOCKET sock, char *szbuf)
+{
+    // 1. 解析客户端下载请求包
+    STRU_DOWNLOADFILE_RQ *sdq = (STRU_DOWNLOADFILE_RQ *)szbuf;
+
+    // 2. SQL查询：查询文件id和目标文件在服务器的目录
+    char szsql[SQLLEN] = {};
+    sprintf(szsql,"select 0113disk.file.f_id,f_path from 0113disk.file join 0113disk.user_file on 0113disk.file.f_id = 0113disk.user_file.f_id and 0113disk.user_file.u_id = %d and f_name = '%s';",sdq->m_userid,sdq->filename);
+    list<string> lst;
+    m_pSQL->SelectMySql(szsql, 2, lst);
+
+    // 3. 提取查询结果（文件ID和路径）
+    int fid=std::stoi(lst.front());
+    lst.pop_front();
+    string fpath=lst.front();   //这里的目录是目标文件存在服务器中的目录
+    //int fsize=sdq->file_size;
+    string strdownloadpath=sdq->downloadpath;   // 这里sdq协议包中的路径客户端指定的下载目录
+
+    // 4. 创建独立线程发送文件，避免阻塞主线程
+    std::thread downloadthread(download,m_pTCPNet,fpath,sock,fid,strdownloadpath);
+    downloadthread.detach();// 线程分离，独立运行
+}
+
+//下载线程函数
+void download(INet* pTCPNet,string fpath,SOCKET sock,int fid,string downloadpath)
+{
+    STRU_DOWNLOADFILE_RS sds;
+    strcpy(sds.downloadpath,downloadpath.c_str());
+    sds.fileid=fid;
+    QString qfpath=QString::fromUtf8(fpath.c_str());
+    QString fileName =qfpath.section('/',-1);
+    strcpy(sds.filename,fileName.toStdString().c_str());
+    FILE* pfile = _wfopen(utf8ToWide(fpath.c_str()).c_str(), L"rb");
+    if(!pfile)
+    {
+        qDebug()<<"无法打开文件";
+        return;
+    }
+    int filesize=getFileSize(pfile);
+    printf("filesize:%d\n",filesize);
+    int totalread=0;
+    sds.totalfilesize=filesize;
+    while(totalread<filesize)
+    {
+        int read=fread(sds.m_filecontent,1,sizeof(sds.m_filecontent),pfile);
+        if(read>0)
+        {
+            totalread+=read;
+            qDebug()<<"读取字节数："<<read;
+            //printf("读取%d字节\n",read);
+            sds.pagesize=read;
+            pTCPNet->sendData(sock,(char*)&sds,sizeof(sds));
+        }
+    }
+    fclose(pfile);
+    //printf("文件读取完毕\n");
+    qDebug()<<"读取完毕";
+}
+
+------------------------------------------------------------------------------------------------------------
+
+c.Widget.cpp
+void Widget::slot_download(STRU_DOWNLOADFILE_RS* psds) {
+    // 1. 规范化路径处理
+    std::string downloadpath = psds->downloadpath;
+    if (!downloadpath.empty() && downloadpath.back() != '/' && downloadpath.back() != '\\') {
+        downloadpath += '/';
+    }
+    downloadpath += psds->filename;
+
+
+    int fid = psds->fileid;
+
+    // 2. 检查是否已有下载信息
+    auto it = m_mapFidtoDownloadfileInfo.find(fid);
+    if (it == m_mapFidtoDownloadfileInfo.end()) {
+        // 新文件下载
+        DownloadFileInfo* pinfo = new DownloadFileInfo;
+        pinfo->m_pos = 0;
+        pinfo->m_filesize = psds->totalfilesize;
+        pinfo->downloadpath = downloadpath;
+
+        // 3. 总是以写入二进制模式创建新文件
+        FILE* file = _wfopen(utf8ToWide(downloadpath.c_str()).c_str(), L"wb");
+        if (!file) {
+            qDebug() << "创建文件失败:" << QString::fromStdString(downloadpath);
+            delete pinfo;
+            return;
+        }
+
+        pinfo->pfile = file;
+        m_mapFidtoDownloadfileInfo.emplace(fid, pinfo);
+    }
+
+    // 4. 获取下载信息
+    DownloadFileInfo* pinfo = m_mapFidtoDownloadfileInfo[fid];
+    FILE* pfile = pinfo->pfile;
+
+    // 5. 写入数据前定位到正确位置
+    if (_fseeki64(pfile, pinfo->m_pos, SEEK_SET) != 0) {
+        qDebug() << "文件定位失败";
+        return;
+    }
+
+    // 6. 写入数据
+    int remaining = psds->pagesize;
+    int writenum = 0;
+    const char* data = psds->m_filecontent;
+
+    while (remaining > 0) {
+        int written = fwrite(data + writenum, 1, remaining, pfile);
+        if (written <= 0) {
+            qDebug() << "写入失败，错误码:" << ferror(pfile);
+            fflush(pfile);
+            break;
+        }
+
+        writenum += written;
+        remaining -= written;
+        pinfo->m_pos += written;
+
+        // 定期刷新缓冲区
+        if (writenum % 4096 == 0) {
+            fflush(pfile);
+        }
+    }
+
+    // 7. 检查是否完成
+    if (pinfo->m_pos >= pinfo->m_filesize) {
+        qDebug() << "传输完成:" << QString::fromStdString(downloadpath);
+        fclose(pfile);
+        delete pinfo;
+        m_mapFidtoDownloadfileInfo.erase(fid);
+    } else {
+        fflush(pfile); // 确保数据写入磁盘
+    }
+}
