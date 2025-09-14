@@ -1,4 +1,140 @@
 面试官：介绍下你网盘的分享功能
 回答：
+
+(一) 分享链接生成
 客户端：
-首先用户在文件列表中点击目标文件，点击分享链接按钮，客户端会获取当前文件的文件名和用户id，构造分享
+首先用户在文件列表中点击目标文件，点击分享链接按钮，客户端会获取当前文件的文件名和用户id，构造分享请求协议包，发送给服务器，请求生成分享码。
+
+服务器：
+服务器收到请求后，会用随机算法生成4位唯一字符串作为分享标识。接着进行双端存储，分别写入MySQL的user_share表：记录share_code(分享码)、u_id(分享者id)、f_id(文件id)、create_time(创建时间)，以及同步缓存到Redis：以分享码为键，存储包含文件id、分享者id的json数据，设置24小时过期时间(自动失效，无需手动清理)。接着将4位分享码封装成响应包，发送给客户端。
+
+(二) 提取下载（他人通过分享码获取文件）
+1.客户端发起提取请求
+接收者在提取链接界面输入分享码，点击提取文件后，客户端会构造json格式请求包，json中包含输入的分享码，接着通过网络模块将请求发送给服务器。
+2.服务器处理提取请求
+服务器接受到json请求后，会优先查Redis：用分享码为键查询缓存，若存在且未过期（24小时内），直接从json缓存中获取文件id；若缓存未命中则查MySQL的user_share表确认分享码有效性，获取文件id。接着通过文件id查找file表的文件路径（服务器存储路径），然后调用downloadbyjson线程，按“Head-Body-Tail"三阶段发送数据。
+Head阶段：发送文件元数据（文件名、大小、总块数），JSON 格式为{"type":_default_protocol_getlink_head_rs, "fileId":123, "fileName":"doc.pdf", "totalSize":204800};
+Body阶段：将文件按4KB分块，每块用Base64编码后嵌入json({"type":_default_protocol_getlink_body_rs, "fileId":123, "data":"Base64编码的块内容", "blockNum":1})，
+Tail阶段：发送传输完成标识({"type":_default_protocol_getlink_tail_rs, "fileId":123, "status":0})。
+
+(二) 客户端接收并处理
+客户端收到json数据后，会按消息类型分别处理head、body、tail信息
+处理head消息：解析文件名和总大小，在用户指定的本地目录创建空文件，初始化下载文件结构体(DownloadInfo，记录文件id、总大小、当前写入位置)，存入下载状态map表中，这里其实和普通下载是一样的。
+处理Body消息：从 JSON 中提取 Base64 编码的块数据，解码后写入本地文件，更新DownloadInfo中的当前位置（m_pos += 块大小）；
+处理Tail消息：确认m_pos等于总大小（传输完整），关闭本地文件，从 map 中删除记录，弹窗提示 “文件已保存至 XX 路径”。
+
+JSON+Base64 适配：通过 JSON 传输结构化元数据，Base64 编码解决二进制文件块在 JSON 中的传输兼容问题；
+
+a. Widget.cpp
+
+void Widget::on_pushButton_5_clicked()//发送分享链接
+{
+    //获取分享文件
+    int nRow=ui->tableWidget->currentRow();
+    int totalCount=ui->tableWidget->rowCount();
+    if(nRow==-1||nRow>=totalCount)
+    {
+        return;
+    }
+    QTableWidgetItem *pItem=ui->tableWidget->item(nRow,0);
+
+    //发送分享链接请求
+    STRU_SHARELINK_RQ ssr;
+    ssr.m_userId=m_userId;
+    strcpy(ssr.m_szFileName,pItem->text().toStdString().c_str());
+
+    m_pKernel->sendData((char*)&ssr,sizeof(ssr));
+}
+
+------------------------------------------------------------------------------------------------------------
+
+b.  tcpkernel.cpp
+// 服务器端处理客户端“生成分享链接”请求的核心函数
+// 功能：接收客户端分享请求，生成4位唯一分享码，同步存储到Redis（缓存）和MySQL（持久化），最终返回分享码给客户端
+void TCPKernel::sharelinkrq(SOCKET sock, char *szbuf)
+{
+    // 1. 解析客户端发送的分享请求协议包
+    STRU_SHARELINK_RQ *pssr=(STRU_SHARELINK_RQ*)szbuf;
+    
+    // 2. 初始化服务器的分享响应结构体
+    // STRU_SHARELLINK_RS：服务器分享响应结构体（包含m_szFileName-文件名、m_szCode-生成的4位分享码）
+    STRU_SHARELLINK_RS ssr;
+    strcpy(ssr.m_szFileName,pssr->m_szFileName);
+
+    // 3. 生成4位唯一分享码（数字0-9 + 大写字母A-Z混合，避免重复）
+    // 3.1 初始化随机数种子：以当前系统时间为种子，确保每次生成的随机码不重复（time(0)返回当前时间戳）
+    srand((unsigned int)time(0));
+    char c;
+    char szsql[SQLLEN]={0};
+    list<string> lststr;
+    char szCode[5]={0};
+    
+    // 3.2 循环生成分享码，直到生成“在MySQL中不存在”的唯一码（避免分享码冲突）
+    while(1)
+    {
+        for (int i = 0; i < 4; i++) {
+            
+            int randNum = rand() % 36;  // 生成0-35的随机数（对应10个数字+26个字母，共36种可能）
+            if (randNum < 10){
+                c = randNum + '0'; // 生成数字 0-9 对应的 ASCII 字符
+            }
+            else {
+                c = randNum - 10 + 'A'; // 生成字母 A-Z 对应的 ASCII 字符
+            }
+            szCode[i]=c;
+        }
+        
+        // 3.2.2 查MySQL的user_share表，判断当前生成的分享码是否已存在
+        sprintf(szsql,"select num from 0113disk.user_share where code = '%s'",szCode);
+        m_pSQL->SelectMySql(szsql,1,lststr);
+        
+        // 3.2.3 若查询结果为空（分享码不存在），跳出循环；否则清空列表继续生成
+        if(lststr.empty())
+        {
+        break;  // 找到唯一分享码，退出循环
+        }
+        else
+        {
+        lststr.pop_back();  // 清空当前查询结果列表，准备下一次循环判断
+        }
+    }
+    
+    
+    // 4. 查myview视图，获取待分享文件的f_id（文件唯一ID）和f_path（服务器存储路径）
+    // myview：项目预定义的关联视图（关联file表和user_file表），用于快速查询“用户-文件”关联关系
+    sprintf(szsql,"select f_id,f_path from myview where u_id=%lld and f_name ='%s'",pssr->m_userId,pssr->m_szFileName);
+    m_pSQL->SelectMySql(szsql,2,lststr);
+    
+    // 5. 若查询到有效文件信息，同步存储到Redis（缓存）和MySQL（持久化）
+    if(lststr.size()>0)
+    {
+        string strFileId=lststr.front();
+        lststr.pop_front();
+        string f_path=lststr.front();
+        lststr.pop_front();
+        
+        // 5.2 存储文件信息到Redis（缓存，24小时过期，由RedisManager管理）
+        // RedisManager::instance()：获取Redis管理类的单例（项目中Redis操作的统一入口）
+        // storeFileInfoJson：自定义函数，将f_id（文件ID）、f_path（存储路径）以JSON格式存入Redis，键为"share:{szCode}"
+        RedisManager& redis=RedisManager::instance();
+        !redis.storeFileInfoJson(strFileId,f_path,szCode);  // ！表示忽略返回值（实际项目可加错误判断）
+        
+        // 5.3 将分享关系存入MySQL的user_share表（持久化，避免Redis过期后无记录）
+        long long FileId=atoll(strFileId.c_str());
+            //将分享的文件信息存储到数据库中
+        sprintf(szsql,"insert into user_share(u_id,f_id,code) values(%lld,%lld,'%s')",pssr->m_userId,FileId,szCode);
+        m_pSQL->UpdateMySql(szsql);
+    }
+    //发回复
+    strcpy(ssr.m_szCode,szCode);
+    m_pTCPNet->sendData(sock,(char*)&ssr,sizeof(ssr));
+}
+
+
+剩下代码暂时欠缺
+c. Widget::on_pushButton_pickLink_clicked()
+
+d. TCPKernel::getlinkfile
+
+e. Widget::slot_downloadbyjson(json &js)
+待续......
